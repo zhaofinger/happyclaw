@@ -88,6 +88,8 @@ export interface IMChannel {
     fileName?: string,
   ): Promise<void>;
   setTyping(chatId: string, isTyping: boolean): Promise<void>;
+  updateStreamingDraft?(chatId: string, text: string): Promise<void>;
+  clearStreamingDraft?(chatId: string): Promise<void>;
   /** Clear the ack reaction for a chat (e.g. when streaming card handled the reply) */
   clearAckReaction?(chatId: string): void;
   isConnected(): boolean;
@@ -331,6 +333,16 @@ export function createTelegramChannel(
       await inner.sendMessage(chatId, text, localImagePaths);
     },
 
+    async updateStreamingDraft(chatId: string, text: string): Promise<void> {
+      if (!inner) return;
+      await inner.updateStreamingDraft(chatId, text);
+    },
+
+    async clearStreamingDraft(chatId: string): Promise<void> {
+      if (!inner) return;
+      await inner.clearStreamingDraft(chatId);
+    },
+
     async sendImage(
       chatId: string,
       imageBuffer: Buffer,
@@ -366,7 +378,11 @@ export function createTelegramChannel(
     async setTyping(chatId: string, isTyping: boolean): Promise<void> {
       // Always clear existing timer first
       clearTypingTimer();
-      if (!isTyping || !inner) return;
+      if (!isTyping) {
+        if (inner) await inner.clearStreamingDraft(chatId);
+        return;
+      }
+      if (!inner) return;
 
       const sendAction = async (): Promise<void> => {
         if (!inner) return;

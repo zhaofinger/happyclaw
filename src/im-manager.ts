@@ -225,6 +225,28 @@ class IMConnectionManager {
     // No fallback for typing — silently ignore if owner's connection is unavailable
   }
 
+  async updateStreamingDraft(jid: string, text: string): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return;
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.updateStreamingDraft) {
+      await channel.updateStreamingDraft(chatId, text);
+    }
+  }
+
+  async clearStreamingDraft(jid: string): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return;
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.clearStreamingDraft) {
+      await channel.clearStreamingDraft(chatId);
+    }
+  }
+
   /**
    * Clear the ack reaction for a chat (e.g. when streaming card handled the reply).
    */

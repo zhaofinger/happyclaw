@@ -72,6 +72,8 @@ export interface TelegramConnection {
     fileName: string,
   ): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
+  updateStreamingDraft(chatId: string, text: string): Promise<void>;
+  clearStreamingDraft(chatId: string): Promise<void>;
   isConnected(): boolean;
 }
 
@@ -179,17 +181,117 @@ export function createTelegramConnection(
   const POLLING_RESTART_DELAY_MS = 5000;
 
   const msgCache = new Map<string, number>();
+  const draftStates = new Map<
+    string,
+    {
+      draftId: number;
+      lastSentText: string;
+      pendingText: string | null;
+      flushTimer: NodeJS.Timeout | null;
+      lastSentAt: number;
+      unsupported: boolean;
+    }
+  >();
   let bot: Bot | null = null;
   let pollingPromise: Promise<void> | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let stopping = false;
   let readyFired = false;
+  let nextDraftId = 1;
   const telegramApiAgent =
     config.proxyUrl && config.proxyUrl.trim()
       ? new ProxyAgent({
           getProxyForUrl: () => config.proxyUrl!.trim(),
         })
       : new HttpsAgent({ keepAlive: true, family: 4 });
+  const DRAFT_THROTTLE_MS = 700;
+  const DRAFT_TEXT_LIMIT = 4096;
+
+  function buildDraftPreview(text: string): string {
+    const normalized = text.trim();
+    if (!normalized) return '';
+    if (normalized.length <= DRAFT_TEXT_LIMIT) return normalized;
+    const tailLength = DRAFT_TEXT_LIMIT - 2;
+    return `…\n${normalized.slice(-tailLength)}`;
+  }
+
+  function getOrCreateDraftState(chatId: string) {
+    let state = draftStates.get(chatId);
+    if (!state) {
+      state = {
+        draftId: nextDraftId++,
+        lastSentText: '',
+        pendingText: null,
+        flushTimer: null,
+        lastSentAt: 0,
+        unsupported: false,
+      };
+      if (nextDraftId > 0x7fffffff) nextDraftId = 1;
+      draftStates.set(chatId, state);
+    }
+    return state;
+  }
+
+  function clearDraftState(chatId: string): void {
+    const state = draftStates.get(chatId);
+    if (state?.flushTimer) {
+      clearTimeout(state.flushTimer);
+    }
+    draftStates.delete(chatId);
+  }
+
+  function isDraftUnsupported(err: unknown): boolean {
+    const anyErr = err as { error_code?: number; description?: string; message?: string };
+    const desc = String(anyErr?.description ?? anyErr?.message ?? '');
+    const code = Number(anyErr?.error_code ?? NaN);
+    return code === 400 || code === 403 || /sendMessageDraft|draft|forum topic|message thread|private chat/i.test(desc);
+  }
+
+  async function flushStreamingDraft(chatId: string): Promise<void> {
+    if (!bot) return;
+    const state = draftStates.get(chatId);
+    if (!state || state.unsupported || !state.pendingText) return;
+
+    const chatIdNum = Number(chatId);
+    if (isNaN(chatIdNum)) {
+      clearDraftState(chatId);
+      return;
+    }
+
+    const text = state.pendingText;
+    state.pendingText = null;
+    if (state.flushTimer) {
+      clearTimeout(state.flushTimer);
+      state.flushTimer = null;
+    }
+    if (!text || text === state.lastSentText) return;
+
+    try {
+      await bot.api.sendMessageDraft(chatIdNum, state.draftId, text);
+      state.lastSentText = text;
+      state.lastSentAt = Date.now();
+    } catch (err) {
+      if (isDraftUnsupported(err)) {
+        state.unsupported = true;
+        logger.debug({ chatId, err }, 'Telegram draft streaming unsupported for chat');
+      } else {
+        logger.debug({ chatId, err }, 'Telegram draft streaming failed');
+      }
+    }
+  }
+
+  function scheduleStreamingDraft(chatId: string): void {
+    const state = draftStates.get(chatId);
+    if (!state || state.unsupported || state.flushTimer) return;
+    const remaining = DRAFT_THROTTLE_MS - (Date.now() - state.lastSentAt);
+    if (remaining <= 0) {
+      void flushStreamingDraft(chatId);
+      return;
+    }
+    state.flushTimer = setTimeout(() => {
+      void flushStreamingDraft(chatId);
+    }, remaining);
+  }
 
   function isDuplicate(msgId: string): boolean {
     const now = Date.now();
@@ -1020,6 +1122,7 @@ export function createTelegramConnection(
       }
 
       try {
+        clearDraftState(chatId);
         // Split original markdown into chunks (leave room for HTML tag overhead)
         const mdChunks = splitMarkdownChunks(text, 3800);
 
@@ -1192,6 +1295,23 @@ export function createTelegramConnection(
       } catch (err) {
         logger.debug({ err, chatId }, 'Failed to send Telegram chat action');
       }
+    },
+
+    async updateStreamingDraft(chatId: string, text: string): Promise<void> {
+      if (!bot) return;
+      const preview = buildDraftPreview(text);
+      if (!preview) return;
+
+      const state = getOrCreateDraftState(chatId);
+      if (state.unsupported || preview === state.lastSentText || preview === state.pendingText) {
+        return;
+      }
+      state.pendingText = preview;
+      scheduleStreamingDraft(chatId);
+    },
+
+    async clearStreamingDraft(chatId: string): Promise<void> {
+      clearDraftState(chatId);
     },
 
     isConnected(): boolean {
